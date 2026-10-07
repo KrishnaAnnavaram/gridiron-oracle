@@ -9,7 +9,7 @@
 ![Models](https://img.shields.io/badge/Models-5-1F3864?style=for-the-badge)
 ![Evaluation](https://img.shields.io/badge/Evaluation-walk--forward-2E5FD9?style=for-the-badge)
 ![CLI commands](https://img.shields.io/badge/CLI_commands-6-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-21_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-20_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -105,7 +105,7 @@ gridiron-oracle gives each of these questions its own component. Each component 
 | Providers | nflverse data, Neo4j and PyTorch. All are optional |
 | Offline mode | Synthetic play-by-play, all features, Elo, baselines, logistic regression and boosting. No download |
 | Safety | No feature uses a game on or after the game date. Neo4j credentials come only from the environment |
-| Tests | **21** unit tests (`pytest`). In CI, 20 pass and 1 skips (PyTorch is not in the `dev` extra) |
+| Tests | **20** pass in CI (`.[dev]` only) and 1 skips (`sequence` extra). With the `sequence` extra, all 21 pass |
 
 ```mermaid
 flowchart LR
@@ -149,7 +149,7 @@ gridiron-oracle/
 ├── data/README.md                 # sources, licence, columns (data files are git-ignored)
 ├── docs/ste-style-guide.md        # writing rules and project vocabulary
 ├── src/gridiron_oracle/           # the 9 modules in 2.1
-├── tests/                         # 21 unit tests, synthetic data only
+├── tests/                         # 21 unit tests (1 needs the sequence extra), synthetic data only
 ├── .env.example                   # variable names only
 └── pyproject.toml                 # core deps: numpy, pandas, scikit-learn, pydantic. Extras: nflverse, neo4j, sequence, dev
 ```
@@ -404,7 +404,7 @@ All numbers come from the synthetic league (10 seasons, 2,560 games, 338,915 pla
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **21 passed** (local). Expected CI: 20 passed, 1 skipped (PyTorch) | `pytest -q` |
+| Unit tests | CI installs only `.[dev]`: **20 passed**, 1 skipped (`sequence` extra, PyTorch). With the extras: 21 passed | `pytest -q` |
 | Leakage tests | Changing all results after a date leaves every earlier feature and Elo probability the same | `pytest tests/test_games_elo_features.py` |
 
 **Walk-forward, test seasons 2015 to 2018, pooled (1,017 games, 7 ties left out)**
@@ -459,7 +459,7 @@ Read these problems before you use gridiron-oracle in production.
 3. **Preprocessing lives in the pipeline.** Scaling and feature selection are fit on training seasons only.
 4. **The test season never selects a model.** Selection uses the season before.
 5. **Probabilities are scored properly.** Log-loss, Brier and calibration sit next to accuracy and two baselines.
-6. **Everything runs offline.** The demo and the 21 tests need no download and no server.
+6. **Everything runs offline.** The demo and the 20 CI tests need no download and no server.
 
 ---
 
