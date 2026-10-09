@@ -69,6 +69,7 @@ This README is the **one location that explains all of gridiron-oracle**. It giv
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one prediction](#42-the-life-cycle-of-one-prediction)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Aggregation of plays into games](#5-aggregation-of-plays-into-games)
 6. 🟢 [Point-in-time features and Elo](#6-point-in-time-features-and-elo)
 7. 🟣 [Models and walk-forward evaluation](#7-models-and-walk-forward-evaluation)
@@ -130,6 +131,42 @@ flowchart LR
 | Graph export | `src/gridiron_oracle/graph.py` | Cypher script or push to Neo4j |
 | CLI | `src/gridiron_oracle/cli.py` | The `gridiron-oracle` command with 6 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>gridiron-oracle command"]
+        CFG["config.py<br/>Settings, EloConfig"]
+    end
+    subgraph DATAIN["Data in"]
+        SYN["synthetic.py<br/>make_pbp"]
+        GAMES["games.py<br/>game_table, team_game_table"]
+    end
+    subgraph FEATS["Point-in-time features"]
+        FEAT["features.py<br/>team_form, head_to_head,<br/>build_features"]
+        ELO["elo.py<br/>run_elo"]
+    end
+    subgraph MODELS["Models and export"]
+        MOD["models.py<br/>default_models, walk_forward,<br/>bootstrap_diff"]
+        SEQ["sequence.py<br/>GRUModel, extra sequence"]
+        GRAPH["graph.py<br/>cypher_script, push"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> GAMES
+    CLI --> FEAT
+    CLI --> ELO
+    CLI --> MOD
+    CLI -- "evaluate --sequence" --> SEQ
+    CLI -- "export-neo4j" --> GRAPH
+    FEAT --> ELO
+    MOD --> FEAT
+    SEQ --> MOD
+    GRAPH --> CFG
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -164,6 +201,17 @@ gridiron-oracle/
 ### 3.2 Only earlier games in a feature
 Form features use `shift(1)` before `rolling`, so a game never sees itself. Head-to-head meetings need a strictly earlier date in both home and away directions. A test changes all results after a date and checks that no earlier feature changes.
 
+```mermaid
+flowchart LR
+    TG[/"Team-game rows of one team,<br/>sorted by game_date, game_id"/] --> SH["shift(1):<br/>move each value one game later"]
+    SH --> ROLL["rolling(window).mean<br/>form_*"]
+    SH --> EXP["Per season: expanding mean<br/>std_*"]
+    TG --> DIFF["game_date.diff<br/>rest_days"]
+    ROLL --> ROW[/"Values for game n use<br/>games before n only"/]
+    EXP --> ROW
+    DIFF --> ROW
+```
+
 ### 3.3 Pre-game Elo in date order
 `run_elo` sorts the games by date and stores the ratings before each game. The prediction of a game uses only those ratings. Neo4j is an export, not the engine.
 
@@ -187,23 +235,63 @@ The target is `home_win` (1 = home win, 0 = away win). Ties are left out and cou
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    P["Play-by-play"] --> V["Validate columns and game teams"]
-    V --> G["Game table: final scores, overtime, home_win"]
-    V --> L["Team-game table: stats for and allowed"]
-    L --> F["Form: shift(1) + rolling mean, season to date"]
-    G --> H["Head to head (strictly earlier)"]
-    G --> E["Elo: date order, pre-game ratings"]
-    F --> T["Game feature table"]
+flowchart TD
+    SRC{"Data source"} -- "synth" --> SYN["make_pbp:<br/>synthetic league"]
+    SRC -- "fetch" --> NV[/"nflverse play-by-play<br/>regular season, extra nflverse"/]
+    SYN --> PBP[("data/pbp.csv")]
+    NV --> PBP
+    PBP --> V{"validate_pbp:<br/>columns present, one home<br/>and away team per game?"}
+    V -- "no" --> ERR[/"SchemaError"/]
+    V -- "yes" --> G["game_table: final scores,<br/>overtime, home_win"]
+    V -- "yes" --> L["team_game_table:<br/>stats for and allowed"]
+    L --> F["team_form: shift(1) + rolling mean,<br/>season to date, rest days"]
+    G --> H["head_to_head:<br/>strictly earlier meetings"]
+    G --> E["run_elo: date order,<br/>pre-game ratings"]
+    F --> T["build_features:<br/>merges on game_id"]
     H --> T
     E --> T
-    T --> W["Walk-forward by season"]
+    T --> GS[("data/games.csv")]
+    GS --> W["walk_forward by season"]
     W --> S["Select on season s-1"]
     S --> R["Refit on seasons before s"]
-    R --> M["Score season s: accuracy, log-loss, Brier, ECE"]
+    R --> M["Score season s: accuracy,<br/>log-loss, Brier, ECE"]
+    M --> REP[/"Report: per season, pooled,<br/>bootstrap against elo, calibration"/]
+    REP --> HUMAN{{"HUMAN<br/>analyst reads the intervals and<br/>the calibration before use"}}
+    GS --> NEO["export-neo4j:<br/>Cypher script or push"]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one prediction
+
+```mermaid
+stateDiagram-v2
+    state "Plays of one game" as Plays
+    state "Game row and 2 team rows" as Rows
+    state "Game with pre-game features" as Featured
+    state "Tie, home_win empty" as Tie
+    state "Training game" as Train
+    state "Validation game" as Val
+    state "Test game" as Test
+    state "p_home predicted" as Predicted
+    state "Scored" as Scored
+    [*] --> Plays
+    Plays --> SchemaError: column absent or 2 home teams
+    Plays --> Rows: game_table, team_game_table
+    Rows --> Featured: team_form, head_to_head, run_elo
+    Featured --> Tie: margin 0
+    Featured --> Train: season before s - 1
+    Featured --> Val: season s - 1
+    Featured --> Test: season s
+    Train --> [*]: fits each model
+    Val --> [*]: selects parameters, then joins the refit
+    Test --> Predicted: predict_proba
+    Predicted --> Scored: accuracy, log-loss, Brier, ECE
+    Tie --> [*]: left out and counted
+    SchemaError --> [*]
+    Scored --> [*]
+```
 
 1. Aggregate the plays of all games into the game table and the team-game table.
 2. For each team, compute the form from the previous 8 games.
@@ -215,11 +303,81 @@ flowchart TB
 8. Predict `p_home` for each game of the test season.
 9. Score the probabilities and compare them with the baselines.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as gridiron-oracle CLI
+    participant GAMES as games.py
+    participant FEAT as features.py
+    participant ELO as elo.py
+    participant DATA as data folder
+    participant WF as models.walk_forward
+    participant M as Models
+
+    AN->>CLI: gridiron-oracle build --pbp data/pbp.csv
+    CLI->>CLI: Settings.from_env
+    CLI->>GAMES: game_table(pbp), team_game_table(pbp)
+    GAMES-->>CLI: games and team-game table
+    CLI->>FEAT: build_features(games, long, window, elo)
+    FEAT->>ELO: run_elo(games, EloConfig)
+    ELO-->>FEAT: pre-game ratings and elo_p_home
+    FEAT-->>CLI: one row per game
+    CLI->>DATA: games.csv and team_games.csv
+    AN->>CLI: gridiron-oracle evaluate --n-test 4
+    CLI->>DATA: read games.csv
+    CLI->>WF: walk_forward(df, test seasons, factory)
+    loop each test season s
+        WF->>M: fit(train before s-1, val s-1)
+        M->>M: select on val, refit on train plus val
+        WF->>M: predict_proba(test season s)
+        M-->>WF: p_home
+    end
+    WF-->>CLI: rows per season and predictions
+    CLI->>CLI: pooled, bootstrap_diff against elo, calibration_table
+    CLI-->>AN: tables of metrics and calibration
+```
+
 ---
 
 ## 5. Aggregation of plays into games
 
 **Purpose.** Change plays into game rows and team-game rows with no misalignment.
+
+```mermaid
+flowchart TD
+    IN[/"Play-by-play"/] --> REQ{"All PBP_COLUMNS present?"}
+    REQ -- "no" --> ERR1[/"SchemaError: names<br/>the missing columns"/]
+    REQ -- "yes" --> OPT["Add week, touchdown,<br/>field_goal_result, penalty_yards<br/>if missing"]
+    OPT --> POS["Remove rows with no posteam"]
+    POS --> TEAMS{"More than one home or<br/>away team for a game_id?"}
+    TEAMS -- "yes" --> ERR2[/"SchemaError"/]
+    TEAMS -- "no" --> GT["game_table: groupby game_id,<br/>max running scores"]
+    GT --> OT["overtime = 1 if qtr above 4,<br/>margin = home - away"]
+    OT --> HW{"margin"}
+    HW -- "above 0" --> W1["home_win = 1"]
+    HW -- "below 0" --> W0["home_win = 0"]
+    HW -- "0" --> WT["home_win empty: tie"]
+    W1 --> OUT[/"Game table, sorted by<br/>game_date, game_id"/]
+    W0 --> OUT
+    WT --> OUT
+```
+
+```mermaid
+flowchart LR
+    PBP[/"Validated plays"/] --> OFF["groupby game_id, posteam:<br/>plays, yards, pass and rush yards,<br/>giveaways, third downs, penalty yards"]
+    GT[/"Game table"/] --> SIDES["One home row and<br/>one away row per game"]
+    SIDES --> M1["merge offence stats<br/>on game_id, team, one_to_one"]
+    OFF --> M1
+    M1 --> M2["merge opponent offence as<br/>yards_allowed, takeaways"]
+    OFF --> M2
+    M2 --> CALC["third_rate, win 1, 0 or 0.5"]
+    CALC --> TWO{"Exactly 2 rows<br/>per game?"}
+    TWO -- "no" --> ERR[/"SchemaError"/]
+    TWO -- "yes" --> OUT[/"Team-game table"/]
+```
 
 | Input | Output |
 |---|---|
@@ -246,6 +404,23 @@ flowchart TB
 
 **Purpose.** Describe each team as it was before kickoff.
 
+```mermaid
+flowchart LR
+    LONG[/"Team-game table"/] --> TF["team_form:<br/>form_*, std_*, form_games, rest_days"]
+    TF --> HOME["Home rows,<br/>prefix home_"]
+    TF --> AWAY["Away rows,<br/>prefix away_"]
+    GAMES[/"Game table"/] --> ELO["run_elo:<br/>elo_home_pre, elo_away_pre, elo_p_home"]
+    GAMES --> H2H["head_to_head:<br/>h2h_games, h2h_margin"]
+    GAMES --> MER["Merge on game_id,<br/>validate one_to_one"]
+    ELO --> MER
+    HOME --> MER
+    AWAY --> MER
+    H2H --> MER
+    MER --> DIFF["diff_* = home - away,<br/>elo_diff"]
+    DIFF --> OUT[/"One row per game"/]
+    OUT --> FC["feature_columns:<br/>never score, margin, result"]
+```
+
 | Feature group | Definition |
 |---|---|
 | `form_*` | Mean of the previous `window` games (default 8) of the team, all seasons |
@@ -253,11 +428,30 @@ flowchart TB
 | `form_games`, `rest_days` | Number of games in the window, days since the previous game |
 | `h2h_games`, `h2h_margin` | Earlier meetings and their mean margin for today's home team |
 | `elo_home_pre`, `elo_away_pre`, `elo_p_home`, `elo_diff` | Pre-game Elo values |
-| `diff_*` | Home value minus away value for each form feature |
+| `diff_*` | Home value minus away value for each form, season-to-date and rest-days feature |
 
 Stats in the form groups: points for, points against, yards, yards allowed, giveaways, takeaways, third-down rate, pass yards, rush yards and wins.
 
 **Elo procedure**
+
+```mermaid
+flowchart TD
+    IN[/"Games sorted by<br/>game_date, game_id"/] --> NS{"First game of<br/>a new season?"}
+    NS -- "yes" --> REV["Each rating moves 1/3 of the way<br/>to 1505, GRIDIRON_ELO_REVERT"]
+    NS -- "no" --> GET["Get the ratings,<br/>1500 for a new team"]
+    REV --> GET
+    GET --> EXPH["expected_home: home advantage 55"]
+    EXPH --> STORE["Store elo_home_pre,<br/>elo_away_pre, elo_p_home"]
+    STORE --> RES{"Margin"}
+    RES -- "0" --> TIE["Result 0.5, multiplier 1"]
+    RES -- "not 0" --> MOV["Result 1 or 0,<br/>mov_multiplier from margin<br/>and winner Elo lead"]
+    TIE --> UPD["delta = K x multiplier x<br/>result - expected"]
+    MOV --> UPD
+    UPD --> APPLY["Home + delta, away - delta"]
+    APPLY --> NEXT{"More games?"}
+    NEXT -- "yes" --> NS
+    NEXT -- "no" --> OUT[/"EloResult: games with<br/>pre-game values, final ratings"/]
+```
 
 1. Sort the games by date and `game_id`.
 2. At the first game of a new season, move each rating one third of the way to 1505.
@@ -272,6 +466,22 @@ Stats in the form groups: points for, points against, yards, yards allowed, give
 ## 7. Models and walk-forward evaluation
 
 **Purpose.** Give a home-win probability for each game and measure it fairly.
+
+```mermaid
+flowchart TD
+    IN[/"Game feature table,<br/>test seasons"/] --> S["For each test season s"]
+    S --> SPLIT["Drop ties: train before s - 1,<br/>val = s - 1, test = s"]
+    SPLIT --> EMPTY{"A part is empty?"}
+    EMPTY -- "yes" --> ERR1[/"ValueError"/]
+    EMPTY -- "no" --> ORDER{"Train dates before val,<br/>val dates before test?"}
+    ORDER -- "no" --> ERR2[/"AssertionError:<br/>walk-forward order is broken"/]
+    ORDER -- "yes" --> MODELS["For each model of the factory:<br/>fit(train, val)"]
+    MODELS --> PRED["predict_proba on test"]
+    PRED --> ROW["SeasonResult: n, ties left out,<br/>accuracy, log-loss, Brier, params"]
+    ROW --> NEXT{"More test seasons?"}
+    NEXT -- "yes" --> S
+    NEXT -- "no" --> OUT[/"WalkForward: rows and predictions,<br/>pooled with ECE"/]
+```
 
 | Model | What it is | Hyperparameters (selected on the validation season) |
 |---|---|---|
@@ -289,6 +499,43 @@ Stats in the form groups: points for, points against, yards, yards allowed, give
 4. Refit the best combination on train plus validation.
 5. Predict the test season and calculate the metrics.
 
+The learned models (`SklearnModel`) select their hyperparameters on the validation season.
+
+```mermaid
+flowchart TD
+    IN[/"train, val"/] --> COLS["feature_columns"]
+    COLS --> GRID["All combinations of the grid"]
+    GRID --> MANY{"val present and<br/>more than one combination?"}
+    MANY -- "no" --> FIRST["Use the first combination"]
+    MANY -- "yes" --> LOOP["For each combination:<br/>make the pipeline, fit on train"]
+    LOOP --> LL["log_loss on val"]
+    LL --> BEST["Keep the lowest log-loss"]
+    BEST --> REFIT["Refit on train plus val"]
+    FIRST --> REFIT
+    REFIT --> KIND{"Model"}
+    KIND -- "logistic" --> LP["Imputer, VarianceThreshold,<br/>StandardScaler, SelectKBest,<br/>LogisticRegression"]
+    KIND -- "boosting" --> BP["HistGradientBoostingClassifier,<br/>200 iterations, L2 1.0"]
+    LP --> OUT[/"predict_proba: p_home"/]
+    BP --> OUT
+```
+
+The optional GRU (`sequence.GRUModel`) reads the real sequence of the earlier games of each team.
+
+```mermaid
+flowchart TD
+    LONG[/"Team-game table"/] --> BS["build_sequences: for each game and team,<br/>the last 8 earlier games, oldest first"]
+    BS --> PAD["Zero padding and<br/>a mask flag for short histories"]
+    PAD --> NORM["Scale with mean and SD<br/>of the training sequences"]
+    NORM --> GRU["One shared GRU, hidden 16:<br/>home code and away code"]
+    ELOD[/"elo_home_pre - elo_away_pre,<br/>divided by 100"/] --> LIN["Linear layer on home code,<br/>away code, Elo difference"]
+    GRU --> LIN
+    LIN --> TRAIN["Adam 3e-3, BCE with logits,<br/>batches of 128, up to 40 epochs"]
+    TRAIN --> ES{"No val gain for 5 epochs,<br/>or 40 epochs done?"}
+    ES -- "no" --> TRAIN
+    ES -- "yes" --> BEST["Load the best state"]
+    BEST --> OUT[/"sigmoid: p_home"/]
+```
+
 ---
 
 ## 8. The decision rules
@@ -304,6 +551,23 @@ Stats in the form groups: points for, points against, yards, yards allowed, give
 | Calibration bins | 10 equal-width bins | `calibration_table`, `ece` |
 | Bootstrap | 1000 game resamples, 95 % percentile interval | `bootstrap_diff` |
 | Default test seasons | the last 4 seasons in the table (`--n-test`) | CLI |
+
+The `evaluate` command applies these rules to the walk-forward predictions.
+
+```mermaid
+flowchart TD
+    PRED[/"Walk-forward predictions:<br/>game_id, season, model, p_home, home_win"/] --> PER["Per season and model:<br/>accuracy, log-loss, Brier"]
+    PRED --> POOL["pooled: accuracy, log-loss,<br/>Brier, ECE per model"]
+    POOL --> LEARN{"Learned model?<br/>not home-team or elo"}
+    LEARN -- "yes" --> BOOT["bootstrap_diff against elo:<br/>1000 game resamples, 2.5 and 97.5 %"]
+    POOL --> BEST["Model with the lowest<br/>pooled log-loss"]
+    BEST --> CAL["calibration_table:<br/>10 equal-width bins"]
+    PER --> JS[/"--json: seasons and<br/>pooled only"/]
+    POOL --> JS
+    PER --> OUT[/"Printed report"/]
+    BOOT --> OUT
+    CAL --> OUT
+```
 
 **Metrics**
 
@@ -369,11 +633,45 @@ pip install -e ".[nflverse]"
 gridiron-oracle fetch --first 2009 --last 2018 --out data/pbp.csv
 ```
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["gridiron-oracle synth"]
+    INS --> FET["gridiron-oracle fetch<br/>extra nflverse"]
+    SYN --> PBP[("data/pbp.csv")]
+    FET --> PBP
+    PBP --> BLD["gridiron-oracle build"]
+    BLD --> GS[("data/games.csv")]
+    BLD --> TG[("data/team_games.csv")]
+    GS --> ELO["gridiron-oracle elo"]
+    GS --> EV["gridiron-oracle evaluate"]
+    TG -- "--sequence" --> EV
+    GS --> EXP["gridiron-oracle export-neo4j"]
+    EXP --> CY[("outputs/graph.cypher")]
+    EXP -- "--push" --> NEO[("Neo4j server")]
+```
+
+`export-neo4j` runs Elo again on the game table and writes the games as `PLAYED` relationships between `Team` nodes.
+
+```mermaid
+flowchart TD
+    IN[/"data/games.csv"/] --> ELO["run_elo: pre-game values"]
+    ELO --> REC["_records: game fields,<br/>dates as YYYY-MM-DD"]
+    REC --> PUSH{"--push?"}
+    PUSH -- "no" --> CY["cypher_script: constraint on Team.name,<br/>one MERGE line per game"]
+    CY --> FILE[/"outputs/graph.cypher<br/>for cypher-shell -f"/]
+    PUSH -- "yes" --> CRED{"NEO4J_URI, NEO4J_USER and<br/>NEO4J_PASSWORD set?"}
+    CRED -- "no" --> ERR[/"RuntimeError"/]
+    CRED -- "yes" --> DRV["neo4j driver, extra neo4j:<br/>UNWIND rows, MERGE Team and PLAYED"]
+    DRV --> NEO[("Neo4j")]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `GRIDIRON_SEED` | models | Random seed, default 7 |
+| `GRIDIRON_SEED` | models | Random seed of the models with `evaluate --sequence`, default 7. Without `--sequence`, the models use seed 0. `synth` uses `--seed` |
 | `GRIDIRON_WINDOW` | features | Form window in games, default 8 |
 | `GRIDIRON_ELO_K` | Elo | K factor, default 20 |
 | `GRIDIRON_ELO_HFA` | Elo | Home advantage in Elo points, default 55 |
@@ -383,6 +681,19 @@ gridiron-oracle fetch --first 2009 --last 2018 --out data/pbp.csv
 | `NEO4J_PASSWORD` | graph export | Neo4j password (secret) |
 
 Credentials are only in a local `.env` file or the shell environment. Git ignores `.env`. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    PENV[/"Process environment"/] --> ENV["_env: empty value<br/>gives the default"]
+    ENV --> FE["Settings.from_env"]
+    FE --> ELO["EloConfig: k above 0,<br/>home_advantage 0 or more,<br/>revert 0 to 1"]
+    FE --> WIN["window 1 to 32"]
+    FE --> SEC["neo4j_password<br/>as SecretStr"]
+    ELO --> SET[/"Settings, frozen"/]
+    WIN --> SET
+    SEC --> SET
+    SET --> USE["build, elo, evaluate,<br/>export-neo4j"]
+```
 
 ---
 
@@ -401,6 +712,23 @@ Credentials are only in a local `.env` file or the shell environment. Git ignore
 ## 12. Validation results
 
 All numbers come from the synthetic league (10 seasons, 2,560 games, 338,915 plays, 17 ties, 90 overtime games). They are synthetic results, not NFL results.
+
+The synthetic league (`synthetic.make_pbp`) makes the play-by-play from hidden team strengths.
+
+```mermaid
+flowchart TD
+    SEED[/"Seasons, 16 weeks, seed"/] --> STR["32 teams T00 to T31:<br/>hidden offence and defence"]
+    STR --> REG["Each season: strengths<br/>regress, 0.6 x old + noise"]
+    REG --> SCH["_schedule: random pairs<br/>each week, random home team"]
+    SCH --> DRIFT["Each game: small drift<br/>of the 2 teams"]
+    DRIFT --> DRV["20 to 24 drives, home and away<br/>in turn, quarters 1 to 4"]
+    DRV --> OUTC{"Drive outcome from the<br/>edge and the home edge 0.18"}
+    OUTC -- "touchdown, field goal,<br/>turnover or punt" --> PLAYS["3 to 9 plays: pass or run,<br/>yards, third downs, penalties,<br/>running scores"]
+    PLAYS --> TIEQ{"Scores level after<br/>the last drive?"}
+    TIEQ -- "yes, fewer than 4 extra" --> OTD["Add an overtime drive,<br/>qtr 5"]
+    OTD --> OUTC
+    TIEQ -- "no" --> OUT[/"Play-by-play in<br/>nflverse column style"/]
+```
 
 | Validation | Result | Command |
 |---|---|---|
